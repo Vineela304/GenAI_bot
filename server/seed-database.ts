@@ -21,24 +21,41 @@ const llm = new ChatGoogleGenerativeAI({
   apiKey: process.env.GOOGLE_API_KEY, // Google API key from environment variables
 })
 
-// Define simplified schema for furniture item structure to avoid type recursion
+// Define schema for furniture item structure using Zod validation
 const itemSchema = z.object({
-  item_id: z.string(),
-  item_name: z.string(),
-  item_description: z.string(),
-  brand: z.string(),
-  manufacturer_country: z.string(),       // Simplified from nested address object
-  full_price: z.number(),                 // Simplified from nested prices object
-  sale_price: z.number(),
-  categories: z.array(z.string()),
-  notes: z.string(),
+  item_id: z.string(),                    // Unique identifier for the item
+  item_name: z.string(),                  // Name of the furniture item
+  item_description: z.string(),           // Detailed description of the item
+  brand: z.string(),                      // Brand/manufacturer name
+  manufacturer_address: z.object({        // Nested object for manufacturer location
+    street: z.string(),                   // Street address
+    city: z.string(),                     // City name
+    state: z.string(),                    // State/province
+    postal_code: z.string(),              // ZIP/postal code
+    country: z.string(),                  // Country name
+  }),
+  prices: z.object({                      // Nested object for pricing information
+    full_price: z.number(),               // Regular price
+    sale_price: z.number(),               // Discounted price
+  }),
+  categories: z.array(z.string()),        // Array of category tags
+  user_reviews: z.array(                  // Array of customer reviews
+    z.object({
+      review_date: z.string(),            // Date of review
+      rating: z.number(),                 // Numerical rating (1-5)
+      comment: z.string(),                // Review text comment
+    })
+  ),
+  notes: z.string(),                      // Additional notes about the item
 })
 
 // Create TypeScript type from Zod schema for type safety
 type Item = z.infer<typeof itemSchema>
 
-// Create parser without complex nesting to avoid infinite type recursion
-const parser = StructuredOutputParser.fromZodSchema(z.array(itemSchema))
+// Create a simple function to validate items instead of using StructuredOutputParser
+function validateItem(data: any): Item {
+  return itemSchema.parse(data)
+}
 
 // Function to create database and collection before seeding
 async function setupDatabaseAndCollection(): Promise<void> {
@@ -88,25 +105,69 @@ async function createVectorSearchIndex(): Promise<void> {
 }
 
 async function generateSyntheticData(): Promise<Item[]> {
-  // Create detailed prompt instructing AI to generate furniture store data (simplified fields)
-  const prompt = `You are a helpful assistant that generates furniture store item data. Generate 3 furniture store items. Each record should include the following fields: item_id, item_name, item_description, brand, manufacturer_country, full_price, sale_price, categories, notes. Ensure variety in the data and realistic values.
-
-  ${parser.getFormatInstructions()}`  // Add format instructions from parser
-
-  // Log progress to console
   console.log("Generating synthetic data...")
+  const items: Item[] = []
+  
+  // Generate 10 items one by one to ensure proper parsing
+  for (let i = 1; i <= 10; i++) {
+    const prompt = `Generate a single furniture store item as a JSON object with the following structure:
+    {
+      "item_id": "FURN-${i.toString().padStart(3, '0')}",
+      "item_name": "Name of furniture item",
+      "item_description": "Detailed description",
+      "brand": "Brand name",
+      "manufacturer_address": {
+        "street": "Street address",
+        "city": "City name",
+        "state": "State",
+        "postal_code": "ZIP code",
+        "country": "Country"
+      },
+      "prices": {
+        "full_price": 999.99,
+        "sale_price": 799.99
+      },
+      "categories": ["category1", "category2"],
+      "user_reviews": [
+        {
+          "review_date": "2024-01-01",
+          "rating": 5,
+          "comment": "Review comment"
+        }
+      ],
+      "notes": "Additional notes"
+    }
+    
+    Please generate realistic furniture data. Return only the JSON object, no additional text.`
 
-  try {
-    // Send prompt to AI and get response
-    const response = await llm.invoke(prompt)
-    // Parse AI response into structured array of Item objects
-    const data = await parser.parse(response.content as string)
-    console.log(`Successfully generated ${data.length} items`)
-    return data
-  } catch (error) {
-    console.error("Error generating synthetic data:", error)
-    throw error
+    console.log(`Generating item ${i}/10...`)
+    
+    try {
+      const response = await llm.invoke(prompt)
+      let jsonStr = response.content as string
+      
+      // Clean the response - remove markdown code blocks if present
+      jsonStr = jsonStr.trim()
+      if (jsonStr.startsWith('```json')) {
+        jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/\s*```$/, '')
+      } else if (jsonStr.startsWith('```')) {
+        jsonStr = jsonStr.replace(/^```\s*/, '').replace(/\s*```$/, '')
+      }
+      
+      // Parse the JSON response
+      const rawData = JSON.parse(jsonStr.trim())
+      
+      // Validate using Zod schema
+      const item = validateItem(rawData)
+      items.push(item)
+      console.log(`✓ Successfully generated item ${i}`)
+    } catch (error) {
+      console.error(`Error generating item ${i}:`, error)
+      // Continue with next item
+    }
   }
+  
+  return items
 }
 
 // Function to create a searchable text summary from furniture item data
@@ -114,18 +175,25 @@ async function createItemSummary(item: Item): Promise<string> {
   // Return Promise for async compatibility (though this function is synchronous)
   return new Promise((resolve) => {
     // Extract manufacturer country information
-    const manufacturerDetails = `Made in ${item.manufacturer_country}`
+    const manufacturerDetails = `Made in ${item.manufacturer_address.country}`
     // Join all categories into comma-separated string
     const categories = item.categories.join(", ")
+    // Convert user reviews array into readable text format
+    const userReviews = item.user_reviews
+      .map(
+        (review) =>
+          `Rated ${review.rating} on ${review.review_date}: ${review.comment}`
+      )
+      .join(" ")  // Join multiple reviews with spaces
     // Create basic item information string
     const basicInfo = `${item.item_name} ${item.item_description} from the brand ${item.brand}`
     // Format pricing information
-    const price = `At full price it costs: ${item.full_price} USD, On sale it costs: ${item.sale_price} USD`
+    const price = `At full price it costs: ${item.prices.full_price} USD, On sale it costs: ${item.prices.sale_price} USD`
     // Get additional notes
     const notes = item.notes
 
     // Combine all information into comprehensive summary for vector search
-    const summary = `${basicInfo}. Manufacturer: ${manufacturerDetails}. Categories: ${categories}. Price: ${price}. Notes: ${notes}`
+    const summary = `${basicInfo}. Manufacturer: ${manufacturerDetails}. Categories: ${categories}. Reviews: ${userReviews}. Price: ${price}. Notes: ${notes}`
 
     // Resolve promise with complete summary
     resolve(summary)
@@ -168,48 +236,25 @@ async function seedDatabase(): Promise<void> {
       }))
     )
     
-    // Create embeddings model once and reuse
-    const embeddings = new GoogleGenerativeAIEmbeddings({
-      apiKey: process.env.GOOGLE_API_KEY,
-      modelName: "text-embedding-004",
-    })
-    
-    // Process records in smaller batches to avoid memory issues
-    const batchSize = 1 // Process 1 item at a time to minimize memory usage
-    for (let i = 0; i < recordsWithSummaries.length; i += batchSize) {
-      const batch = recordsWithSummaries.slice(i, i + batchSize)
-      console.log(`Processing item ${i + 1} of ${recordsWithSummaries.length}`)
-      
-      try {
-        // Store batch with vector embeddings in MongoDB
-        await MongoDBAtlasVectorSearch.fromDocuments(
-          batch,                       // Process batch of records
-          embeddings,                  // Reuse embeddings instance
-          {
-            collection,                // MongoDB collection reference
-            indexName: "vector_index", // Name of vector search index
-            textKey: "embedding_text", // Field name for searchable text
-            embeddingKey: "embedding", // Field name for vector embeddings
-          }
-        )
-
-        // Log progress for each batch
-        batch.forEach(record => {
-          console.log("Successfully processed & saved record:", record.metadata.item_id)
-        })
-
-        // Add delay between items to allow garbage collection
-        await new Promise(resolve => setTimeout(resolve, 500))
-        
-        // Force garbage collection if available
-        if (global.gc) {
-          global.gc()
+    // Store each record with vector embeddings in MongoDB
+    for (const record of recordsWithSummaries) {
+      // Create vector embeddings and store in MongoDB Atlas using Gemini
+      await MongoDBAtlasVectorSearch.fromDocuments(
+        [record],                    // Array containing single record
+        new GoogleGenerativeAIEmbeddings({            // Google embedding model
+          apiKey: process.env.GOOGLE_API_KEY,         // Google API key
+          modelName: "text-embedding-004",            // Google's standard embedding model (768 dimensions)
+        }),
+        {
+          collection,                // MongoDB collection reference
+          indexName: "vector_index", // Name of vector search index
+          textKey: "embedding_text", // Field name for searchable text
+          embeddingKey: "embedding", // Field name for vector embeddings
         }
-        
-      } catch (error) {
-        console.error(`Error processing item ${i + 1}:`, error)
-        throw error
-      }
+      )
+
+      // Log progress for each successfully processed item
+      console.log("Successfully processed & saved record:", record.metadata.item_id)
     }
 
     // Log completion of entire seeding process
