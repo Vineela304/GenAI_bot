@@ -1,84 +1,211 @@
-// Load environment variables
-import 'dotenv/config'
-// Import Google's Gemini chat model for AI conversation
-import { ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
-// Import MongoDB client type for database operations
-import { MongoClient } from "mongodb"
-// Import MongoDB Atlas vector search for semantic search capabilities
+// Import required modules from LangChain ecosystem
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai"
+import { AIMessage, HumanMessage } from "@langchain/core/messages"
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts"
+import { StateGraph } from "@langchain/langgraph"
+import { Annotation } from "@langchain/langgraph"
+import { DynamicTool } from "@langchain/core/tools"
+import { ToolNode } from "@langchain/langgraph/prebuilt"
+import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb"
 import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"
+import { MongoClient } from "mongodb"
+import "dotenv/config"
 
-// Initialize Google Gemini chat model for customer service conversations
-const llm = new ChatGoogleGenerativeAI({
-  model: "gemini-1.5-flash",
-  temperature: 0.3, // Lower temperature for more consistent customer service responses
-  apiKey: process.env.GOOGLE_API_KEY,
-})
+// Utility function to handle API rate limits with exponential backoff
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error: any) {
+      if (error.status === 429 && attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 30000)
+        console.log(`Rate limit hit. Retrying in ${delay / 1000} seconds...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      throw error
+    }
+  }
+  throw new Error("Max retries exceeded")
+}
 
-// Initialize Google embeddings for vector search
-const embeddings = new GoogleGenerativeAIEmbeddings({
-  model: "embedding-001",
-  apiKey: process.env.GOOGLE_API_KEY,
-})
-
-// Main function to handle customer queries and provide assistance
-export async function callAgent(
-  client: MongoClient,
-  message: string,
-  threadId: string
-): Promise<string> {
+// Main function that creates and runs the AI agent
+export async function callAgent(client: MongoClient, query: string, thread_id: string) {
   try {
-    // Get database and collection references
-    const db = client.db("inventory_database")
+    const dbName = "inventory_database"
+    const db = client.db(dbName)
     const collection = db.collection("items")
 
-    // Set up vector search for finding relevant products
-    const vectorStore = new MongoDBAtlasVectorSearch(embeddings, {
-      collection,
-      indexName: "vector_index",
-      textKey: "summary",
-      embeddingKey: "embedding",
+    // Simplified state structure to avoid deep type instantiation
+    const GraphState = Annotation.Root({
+      messages: Annotation<any[]>({
+        reducer: (x, y) => x.concat(y),
+      }),
     })
 
-    // Perform semantic search to find relevant products based on user query
-    const searchResults = await vectorStore.similaritySearch(message, 3)
+    const itemLookupTool = new DynamicTool({
+      name: "item_lookup",
+      description: "Gathers furniture item details from the Inventory database. Input should be a JSON string with 'query' and optional 'n' fields.",
+      func: async (input: string) => {
+        try {
+          // Parse input (could be JSON string or simple query)
+          let query: string;
+          let n = 10;
+          
+          try {
+            const parsed = JSON.parse(input);
+            query = parsed.query || input;
+            n = parsed.n || 10;
+          } catch {
+            query = input;
+          }
 
-    // Extract product information from search results
-    const relevantProducts = searchResults.map(result => ({
-      name: result.metadata.item_name,
-      description: result.metadata.item_description,
-      brand: result.metadata.brand,
-      price: result.metadata.prices,
-      categories: result.metadata.categories,
-      summary: result.pageContent
-    }))
+          console.log("Item lookup tool called with query:", query)
+          const totalCount = await collection.countDocuments()
+          console.log(`Total documents in collection: ${totalCount}`)
 
-    // Create context-aware prompt for the AI assistant
-    const systemPrompt = `You are a helpful e-commerce customer service assistant. 
-    You help customers find furniture products and answer their questions.
-    
-    Based on the customer's message: "${message}"
-    
-    Here are some relevant products from our inventory:
-    ${relevantProducts.map((product, index) => 
-      `${index + 1}. ${product.name} by ${product.brand}
-         Price: $${product.price.sale_price} (Regular: $${product.price.full_price})
-         Categories: ${product.categories.join(', ')}
-         Description: ${product.description}`
-    ).join('\n\n')}
-    
-    Please provide a helpful response to the customer. If they're looking for products, 
-    recommend the most suitable ones from the list above. If they have other questions, 
-    answer them in a friendly and professional manner.
-    
-    Keep your response concise but informative.`
+          if (totalCount === 0) {
+            return JSON.stringify({
+              error: "No items found in inventory",
+              message: "The inventory database appears to be empty",
+              count: 0
+            })
+          }
 
-    // Get AI response
-    const response = await llm.invoke(systemPrompt)
-    
-    return response.content as string
+          const dbConfig = {
+            collection,
+            indexName: "vector_index",
+            textKey: "embedding_text",
+            embeddingKey: "embedding",
+          }
 
-  } catch (error) {
-    console.error('Error in agent:', error)
-    return "I'm sorry, I'm having trouble processing your request right now. Please try again later."
+          const vectorStore = new MongoDBAtlasVectorSearch(
+            new GoogleGenerativeAIEmbeddings({
+              apiKey: process.env.GOOGLE_API_KEY,
+              model: "text-embedding-004",
+            }),
+            dbConfig
+          )
+
+          const result = await vectorStore.similaritySearchWithScore(query, n)
+          if (result.length === 0) {
+            const textResults = await collection.find({
+              $or: [
+                { item_name: { $regex: query, $options: 'i' } },
+                { item_description: { $regex: query, $options: 'i' } },
+                { categories: { $regex: query, $options: 'i' } },
+                { embedding_text: { $regex: query, $options: 'i' } }
+              ]
+            }).limit(n).toArray()
+
+            return JSON.stringify({
+              results: textResults,
+              searchType: "text",
+              query,
+              count: textResults.length
+            })
+          }
+
+          return JSON.stringify({
+            results: result,
+            searchType: "vector",
+            query,
+            count: result.length
+          })
+        } catch (error: any) {
+          return JSON.stringify({
+            error: "Failed to search inventory",
+            details: error.message,
+            query: input
+          })
+        }
+      }
+    })
+
+    const tools = [itemLookupTool]
+    const toolNode = new ToolNode(tools) as any
+
+    const model = new ChatGoogleGenerativeAI({
+      model: "gemini-1.5-flash",
+      temperature: 0,
+      maxRetries: 0,
+      apiKey: process.env.GOOGLE_API_KEY,
+    }).bindTools(tools)
+
+    function shouldContinue(state: any) {
+      const messages = state.messages
+      const lastMessage = messages[messages.length - 1] as AIMessage
+
+      if (lastMessage.tool_calls?.length) {
+        return "tools"
+      }
+      return "_end_"
+    }
+
+    async function callModel(state: any) {
+      return retryWithBackoff(async () => {
+        const prompt = ChatPromptTemplate.fromMessages([
+          [
+            "system",
+            `You are a helpful E-commerce Chatbot Agent for a furniture store.
+
+IMPORTANT: You have access to an item_lookup tool that searches the furniture inventory database. ALWAYS use this tool when customers ask about furniture items.
+
+Current time: {time}`,
+          ],
+          new MessagesPlaceholder("messages"),
+        ])
+
+        const formattedPrompt = await prompt.formatMessages({
+          time: new Date().toISOString(),
+          messages: state.messages,
+        })
+
+        const result = await model.invoke(formattedPrompt)
+        return { messages: [result] }
+      })
+    }
+
+    const workflow = new StateGraph(GraphState as any)
+      .addNode("agent", callModel)
+      .addNode("tools", toolNode)
+      .addEdge("__start__", "agent")
+      .addConditionalEdges("agent", shouldContinue)
+      .addEdge("tools", "agent")
+
+    const checkpointer = new MongoDBSaver({ client, dbName })
+    const app = workflow.compile({ checkpointer })
+
+    const finalState = await app.invoke(
+      {
+        messages: [new HumanMessage(query)],
+      },
+      {
+        recursionLimit: 15,
+        configurable: { thread_id }
+      }
+    )
+
+    const response = finalState.messages[finalState.messages.length - 1].content
+    console.log("Agent response:", response)
+
+    return response
+  } catch (error: any) {
+    console.error("Error in callAgent:", error.message)
+
+    if (error.status === 429) {
+      throw new Error("Service temporarily unavailable due to rate limits. Please try again in a minute.")
+    } else if (error.status === 401) {
+      throw new Error("Authentication failed. Please check your API configuration.")
+    } else {
+      throw new Error(`Agent failed: ${error.message}`)
+    }
   }
 }
